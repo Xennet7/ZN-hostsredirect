@@ -1,4 +1,4 @@
-name: Build Module
+name: Build and Package Module
 
 on:
   push:
@@ -11,11 +11,11 @@ on:
 
 jobs:
   build:
-    name: Build ZN-hostsredirect Zip
+    name: Build ZN-hostsredirect Flashable ZIP
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -34,20 +34,86 @@ jobs:
       - name: Install Android NDK & CMake
         run: |
           sdkmanager --install "ndk;26.1.10909125" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/26.1.10909125" >> $GITHUB_ENV
 
-      - name: Grant execute permission for gradlew
+      - name: Grant Execute Permissions
         run: chmod +x gradlew
 
-      - name: Build Module with Gradle
-        run: ./gradlew assembleRelease
+      - name: Build with Gradle
+        run: |
+          # Run standard release and zip packaging tasks
+          ./gradlew assembleRelease || ./gradlew build
 
-      - name: Upload Built Module Zip
+      - name: Strip Debug Symbols to Produce .so Files
+        run: |
+          STRIP_TOOL="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          
+          # Find all .so.sym files, strip them, and output the clean .so
+          find . -type f -name "*.so.sym" | while read -r sym_file; do
+            target_so="${sym_file%.sym}"
+            echo "Stripping: $sym_file -> $target_so"
+            "$STRIP_TOOL" --strip-all --discard-all "$sym_file" -o "$target_so"
+          done
+
+      - name: Create Flashable Magisk/Zygisk ZIP
+        run: |
+          mkdir -p output_zip
+          
+          # Check if Gradle already generated a release zip in out/ or build/
+          EXISTING_ZIP=$(find . -maxdepth 4 -type f -name "*.zip" ! -path "./output_zip/*" | head -n 1)
+          
+          if [ -n "$EXISTING_ZIP" ]; then
+            echo "Found Gradle-generated module ZIP: $EXISTING_ZIP"
+            cp "$EXISTING_ZIP" output_zip/ZN-hostsredirect-release.zip
+          else
+            echo "Packaging custom flashable ZIP from module structure..."
+            mkdir -p staging_dir/zygisk
+            
+            # Copy module configuration/scripts if present
+            [ -f module.prop ] && cp module.prop staging_dir/
+            [ -f module/src/main/module.prop ] && cp module/src/main/module.prop staging_dir/
+            [ -d template ] && cp -r template/* staging_dir/ || true
+            [ -d module/src/main/magisk ] && cp -r module/src/main/magisk/* staging_dir/ || true
+            
+            # Place stripped .so libraries into appropriate ABI folders inside the ZIP
+            find . -type f -name "libhostsredirect.so" | while read -r so_file; do
+              case "$so_file" in
+                *arm64-v8a*)
+                  mkdir -p staging_dir/zygisk/arm64-v8a
+                  cp "$so_file" staging_dir/zygisk/arm64-v8a/
+                  ;;
+                *armeabi-v7a*)
+                  mkdir -p staging_dir/zygisk/armeabi-v7a
+                  cp "$so_file" staging_dir/zygisk/armeabi-v7a/
+                  ;;
+                *x86_64*)
+                  mkdir -p staging_dir/zygisk/x86_64
+                  cp "$so_file" staging_dir/zygisk/x86_64/
+                  ;;
+                *x86*)
+                  mkdir -p staging_dir/zygisk/x86
+                  cp "$so_file" staging_dir/zygisk/x86/
+                  ;;
+              esac
+            done
+            
+            cd staging_dir
+            zip -r9 ../output_zip/ZN-hostsredirect-release.zip ./*
+            cd ..
+          fi
+
+      - name: Upload Flashable Module ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: ZN-hostsredirect-Module
-          path: |
-            out/*.zip
-            module/build/outputs/**/*.zip
-            **/build/outputs/**/*.zip
+          name: ZN-hostsredirect-Flashable-Module
+          path: output_zip/*.zip
           if-no-files-found: error
 
+      - name: Upload Stripped .so Files Separately
+        uses: actions/upload-artifact@v4
+        with:
+          name: stripped-so-libraries
+          path: |
+            **/libhostsredirect.so
+          if-no-files-found: warn
